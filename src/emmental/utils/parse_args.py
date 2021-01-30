@@ -157,7 +157,7 @@ def parse_args(parser: Optional[ArgumentParser] = None) -> ArgumentParser:
     learner_config.add_argument(
         "--ignore_index",
         type=nullable_int,
-        default=None,
+        default=-1,
         help="The ignore index, uses for masking samples",
     )
 
