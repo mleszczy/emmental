@@ -342,7 +342,7 @@ class EmmentalModel(nn.Module):
           all tasks.
         """
         uid_dict: Dict[str, List[str]] = defaultdict(list)
-        loss_dict: Dict[str, ndarray] = defaultdict(float)
+        loss_dict: Dict[str, ndarray] = defaultdict(Tensor)
         gold_dict: Dict[str, ndarray] = defaultdict(list)
         prob_dict: Dict[str, ndarray] = defaultdict(list)
         out_dict: Dict[str, Dict[str, ndarray]] = defaultdict(lambda: defaultdict(list))
@@ -358,32 +358,30 @@ class EmmentalModel(nn.Module):
             # Calculate logit and loss for each task
             for task_name, label_name in task_to_label_dict.items():
                 Y = Y_dict[label_name]
-
                 # Select the active samples
                 if Meta.config["learner_config"]["ignore_index"] is not None:
-                    if len(Y.size()) == 1:
-                        active = (
+                    #if len(Y.size()) == 1 or (torch.numel(X_dict["uids"]) == torch.numel(Y)):
+                    active = (
                             Y.detach() != Meta.config["learner_config"]["ignore_index"]
-                        )
-                    else:
-                        active = torch.any(
-                            Y.detach() != Meta.config["learner_config"]["ignore_index"],
-                            dim=1,
-                        )
+                    )
+                    #else:
+                    #    active = torch.any(
+                    #        Y.detach() != Meta.config["learner_config"]["ignore_index"],
+                    #        dim=1,
+                    #    )
                 else:
                     active = torch.BoolTensor([True] * Y.size()[0])  # type: ignore
-
                 # Only calculate the loss when active example exists
                 if active.any():
-                    uid_dict[task_name] = [*itertools.compress(uids, active.numpy())]
-
-                    loss_dict[task_name] = self.loss_funcs[task_name](
-                        output_dict,
-                        move_to_device(
-                            Y_dict[label_name], Meta.config["model_config"]["device"]
-                        ),
-                        move_to_device(active, Meta.config["model_config"]["device"]),
-                    )
+                    uid_dict[task_name] = [*itertools.compress(uids.flatten(), active.numpy().flatten())]
+                    if self.loss_funcs[task_name] is not None:
+                        loss_dict[task_name] = self.loss_funcs[task_name](
+                            output_dict,
+                            move_to_device(
+                                Y_dict[label_name], Meta.config["model_config"]["device"]
+                            ),
+                            move_to_device(active, Meta.config["model_config"]["device"]),
+                        )
 
                     if return_probs:
                         prob_dict[task_name] = (

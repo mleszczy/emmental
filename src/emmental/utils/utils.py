@@ -67,7 +67,7 @@ def pad_batch(
     batch: List[Tensor],
     min_len: int = 0,
     max_len: int = 0,
-    pad_value: int = 0,
+    pad_value: int = -1,
     left_padded: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Convert the batch into a padded tensor and mask tensor.
