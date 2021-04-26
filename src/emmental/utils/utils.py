@@ -59,7 +59,10 @@ def list_to_tensor(
         item_tensor, item_mask_tensor = pad_batch(
             [item.view(-1) for item in item_list], min_len, max_len
         )
-
+        if all((len(item_list[i].size()) == 3) and item_list[i].shape[1] == item_list[0].shape[1] and item_list[i].shape[2] == item_list[0].shape[2]
+            for i in range(len(item_list))):
+                item_tensor = item_tensor.reshape(-1, item_list[0].shape[1], item_list[0].shape[2])
+                item_mask_tensor = item_mask_tensor.reshape(-1, item_list[0].shape[1], item_list[0].shape[2])
     return item_tensor, item_mask_tensor
 
 

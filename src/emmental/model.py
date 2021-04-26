@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import torch
 from numpy import ndarray
+import time
 from torch import Tensor, nn as nn
 from torch.nn import ModuleDict
 from tqdm import tqdm
@@ -161,6 +162,7 @@ class EmmentalModel(nn.Module):
         # Combine module_pool from all tasks
         for key in task.module_pool.keys():
             if key in self.module_pool.keys():
+                print(f"found {key} in module")
                 task.module_pool[key] = self.module_pool[key]
             else:
                 self.module_pool[key] = task.module_pool[key]
@@ -273,8 +275,12 @@ class EmmentalModel(nn.Module):
 
         # Call forward for each task
         for task_name in task_names:
+            seen_outputs = set()
             for action in self.task_flows[task_name]:
-                if action["name"] not in output_dict:
+                # Recompute the output if it appears later in the same task flow
+                # TODO: avoid commenting this out but need to fix issues with tied weights
+                if action["name"] not in output_dict or action["name"] in seen_outputs:
+                    seen_outputs.add(action["name"])
                     if action["inputs"]:
                         try:
                             action_module_device = (
@@ -282,11 +288,14 @@ class EmmentalModel(nn.Module):
                                 if action["module"] in self.module_device
                                 else default_device
                             )
+                            action_inputs_filt = []
+                            for action_name, output_index in action["inputs"]:
+                                if action_name is None:
+                                    action_inputs_filt.append(None)
+                                else:
+                                    action_inputs_filt.append(output_dict[action_name][output_index])
                             input = move_to_device(
-                                [
-                                    output_dict[action_name][output_index]
-                                    for action_name, output_index in action["inputs"]
-                                ],
+                                action_inputs_filt,
                                 action_module_device,
                             )
                         except Exception:
@@ -383,7 +392,7 @@ class EmmentalModel(nn.Module):
                             move_to_device(active, Meta.config["model_config"]["device"]),
                         )
 
-                    if return_probs:
+                    if return_probs and not Meta.indiv_grads:
                         prob_dict[task_name] = (
                             self.output_funcs[task_name](output_dict)[
                                 move_to_device(
@@ -394,6 +403,14 @@ class EmmentalModel(nn.Module):
                             .detach()
                             .numpy()
                         )
+                    # do not detach so we can compute individual gradients!
+                    elif return_probs and Meta.indiv_grads:
+                        prob_dict[task_name] = (
+                            self.output_funcs[task_name](output_dict)[
+                                move_to_device(
+                                    active, Meta.config["model_config"]["device"]
+                                )
+                            ])
                     else:
                         prob_dict[task_name] = None
 
@@ -404,16 +421,22 @@ class EmmentalModel(nn.Module):
                         and self.action_outputs[task_name] is not None
                     ):
                         for action_name, output_index in self.action_outputs[task_name]:
-                            out_dict[task_name][f"{action_name}_{output_index}"] = (
-                                output_dict[action_name][output_index][
-                                    move_to_device(
-                                        active, Meta.config["model_config"]["device"]
-                                    )
-                                ]
-                                .cpu()
-                                .detach()
-                                .numpy()
-                            )
+                            try:
+                                out_dict[task_name][f"{action_name}_{output_index}"] = (
+                                    output_dict[action_name][output_index][
+                                        move_to_device(
+                                            active, Meta.config["model_config"]["device"]
+                                        )
+                                    ]
+                                    .cpu()
+                                    .detach()
+                                    .numpy()
+                                )
+                            # ignore active
+                            except:
+                                out_dict[task_name][f"{action_name}_{output_index}"] = (
+                                    output_dict[action_name][output_index]
+                                )
         else:
             # Calculate logit for each task
             for task_name in task_to_label_dict:
@@ -581,6 +604,7 @@ class EmmentalModel(nn.Module):
         self,
         dataloaders: Union[EmmentalDataLoader, List[EmmentalDataLoader]],
         return_average: bool = True,
+        return_probs: bool = False
     ) -> Dict[str, float]:
         """Score the data from dataloader.
 
@@ -611,7 +635,6 @@ class EmmentalModel(nn.Module):
                 )
                 continue
 
-            return_probs = False
             return_preds = False
             for task_name in dataloader.task_to_label_dict:
                 return_probs = return_probs or self.require_prob_for_evals[task_name]
@@ -782,7 +805,9 @@ class EmmentalModel(nn.Module):
         Args:
           state_dict: The state dict to load.
         """
+        print('module pool', self.module_pool.keys())
         for module_name, module_state_dict in state_dict.items():
+            print(module_name)
             if module_name in self.module_pool:
                 if hasattr(self.module_pool[module_name], "module"):
                     self.module_pool[module_name].module.load_state_dict(

@@ -42,8 +42,8 @@ class EmmentalTask(object):
         action_outputs: Optional[List[Union[Tuple[str, str], Tuple[str, int]]]] = None,
         module_device: Dict[str, Union[int, str, torch.device]] = {},
         weight: Union[float, int] = 1.0,
-        require_prob_for_eval: bool = True,
-        require_pred_for_eval: bool = True,
+        require_prob_for_eval: bool = False,
+        require_pred_for_eval: bool = False,
     ) -> None:
         """Initialize EmmentalTask."""
         self.name = name

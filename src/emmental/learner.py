@@ -9,6 +9,7 @@ from functools import partial
 from typing import Dict, List, Optional, Union
 
 import numpy as np
+import pickle
 import torch
 from numpy import ndarray
 from torch import optim as optim
@@ -46,6 +47,9 @@ class EmmentalLearner(object):
     def __init__(self, name: Optional[str] = None) -> None:
         """Initialize EmmentalLearner."""
         self.name = name if name is not None else type(self).__name__
+        self.grad_bank = defaultdict(list)
+        self.gradients = []
+        self.variances = []
 
     def _set_logging_manager(self) -> None:
         """Set logging manager."""
@@ -494,6 +498,61 @@ class EmmentalLearner(object):
         self.running_probs: Dict[str, List[ndarray]] = defaultdict(list)
         self.running_golds: Dict[str, List[ndarray]] = defaultdict(list)
 
+    def _compute_loss(self, model, uids, X_dict, Y_dict, task_to_label_dict, data_name, split):
+        # Perform forward pass and calcualte the loss and count
+        uid_dict, loss_dict, prob_dict, gold_dict, out_dict = model(
+            uids,
+            X_dict,
+            Y_dict,
+            task_to_label_dict,
+            return_probs=Meta.config["learner_config"]["online_eval"],
+            return_action_outputs=True
+        )
+        # Update running loss and count
+        for task_name in uid_dict.keys():
+            identifier = f"{task_name}/{data_name}/{split}"
+            self.running_uids[identifier].extend(uid_dict[task_name])
+            try:
+                self.running_losses[identifier] += (
+                    loss_dict[task_name].item() * len(uid_dict[task_name])
+                    if len(loss_dict[task_name].size()) == 0
+                    else torch.sum(loss_dict[task_name]).item()
+                )
+            except:
+                # when tuple is returned for loss
+                self.running_losses[identifier] += (
+                    loss_dict[task_name].item() * len(uid_dict[task_name])
+                    if (loss_dict[task_name]["loss"].size()) == 0
+                    else torch.sum(loss_dict[task_name]["loss"]).item()
+                )
+            if Meta.config["learner_config"]["online_eval"]:
+                self.running_probs[identifier].extend(prob_dict[task_name])
+                self.running_golds[identifier].extend(gold_dict[task_name])
+        # Skip the backward pass if no loss is calcuated
+        if not loss_dict:
+            return None
+
+        # Calculate the average loss
+        try:
+            loss = sum(
+                [
+                    model.weights[task_name] * task_loss
+                    if len(task_loss.size()) == 0
+                    else torch.mean(model.weights[task_name] * task_loss)
+                    for task_name, task_loss in loss_dict.items()
+                ]
+            )
+        except:
+            loss = sum(
+                [
+                    model.weights[task_name] * task_loss["loss"]
+                    if len(task_loss["loss"].size()) == 0
+                    else torch.mean(model.weights[task_name] * task_loss["loss"])
+                    for task_name, task_loss in loss_dict.items()
+                ]
+            )
+        return loss, prob_dict, loss_dict, out_dict
+
     def learn(
         self, model: EmmentalModel, dataloaders: List[EmmentalDataLoader]
     ) -> None:
@@ -598,49 +657,66 @@ class EmmentalLearner(object):
                 for uids, X_dict, Y_dict, task_to_label_dict, data_name, split in batch:
                     batch_size += len(next(iter(Y_dict.values())))
 
-                    # Perform forward pass and calcualte the loss and count
-                    uid_dict, loss_dict, prob_dict, gold_dict = model(
-                        uids,
-                        X_dict,
-                        Y_dict,
-                        task_to_label_dict,
-                        return_probs=Meta.config["learner_config"]["online_eval"],
-                        return_action_outputs=False,
-                    )
+                    # TODO: hack to get gradients for mentions and entities
+                    if Meta.indiv_grads:
+                        model.zero_grad()
+                        loss, prob_dict, loss_dict, out_dict = self._compute_loss(model, uids, X_dict, Y_dict, task_to_label_dict, data_name, split)
+                        me_scores = loss_dict["NED"]["scores"]
+                        if isinstance(me_scores, tuple):
+                            dout_dpairs = torch.cat([torch.autograd.grad(loss, s, retain_graph=True, allow_unused=True)[0].detach().cpu() for s in me_scores])
+                            dpairs_dmodel = []
+                            assert Meta.layer_grad in set([n for n, p in model.named_parameters()])
+                            for tup in me_scores:
+                                for val in tup.flatten():
+                                    for n, p in model.named_parameters():
+                                        if n == Meta.layer_grad:
+                                            # compute the gradient of pair value with respect to some weight
+                                            dpairs_dmodel.append(torch.autograd.grad(val, p, retain_graph=True, allow_unused=True)[0].detach().cpu())
+                        else:
+                            dout_dpairs = torch.autograd.grad(loss, me_scores, retain_graph=True, allow_unused=True)[0].detach().cpu()
+                            dpairs_dmodel = []
+                            # autograd requires scalar value
+                            for val in me_scores.flatten():
+                                for n, p in model.named_parameters():
+                                    if n == Meta.layer_grad:
+                                        # compute the gradient of pair value with respect to some weight
+                                        dpairs_dmodel.append(torch.autograd.grad(val, p, retain_graph=True, allow_unused=True)[0].detach().cpu())
+                        dpairs_dmodel = torch.stack(dpairs_dmodel)
 
-                    # Update running loss and count
-                    for task_name in uid_dict.keys():
-                        identifier = f"{task_name}/{data_name}/{split}"
-                        self.running_uids[identifier].extend(uid_dict[task_name])
-                        self.running_losses[identifier] += (
-                            loss_dict[task_name].item() * len(uid_dict[task_name])
-                            if len(loss_dict[task_name].size()) == 0
-                            else torch.sum(loss_dict[task_name]).item()
-                        )
-                        if Meta.config["learner_config"]["online_eval"]:
-                            self.running_probs[identifier].extend(prob_dict[task_name])
-                            self.running_golds[identifier].extend(gold_dict[task_name])
+                        # multiply these to get final derivative wrt model parameters for each pair
+                        indiv_grads = (dout_dpairs.unsqueeze(-1).unsqueeze(-1) * dpairs_dmodel)
+                        summed_grads = indiv_grads.sum(0)
 
-                    # Skip the backward pass if no loss is calcuated
-                    if not loss_dict:
-                        continue
+                        # sanity check that gradients add up expected
+                        model.zero_grad()
+                        loss.backward()
+                        for n, p in model.named_parameters():
+                            if n == Meta.layer_grad:
+                                assert torch.allclose(p.grad.cpu(), summed_grads, rtol=1e-04, atol=1e-05)
 
-                    # Calculate the average loss
-                    loss = sum(
-                        [
-                            model.weights[task_name] * task_loss
-                            if len(task_loss.size()) == 0
-                            else torch.mean(model.weights[task_name] * task_loss)
-                            for task_name, task_loss in loss_dict.items()
-                        ]
-                    )
+                        # save and exit (for now just do one batch)
+                        file = f'{Meta.log_path}/indiv_grads_{Meta.layer_grad}.pkl'
+                        print(f"Saving to {file}")
+                        with open(file, 'wb') as f:
+                            print(indiv_grads.shape)
+                            pickle.dump({"grads": indiv_grads,
+                                "uids": X_dict["uids"],
+                                "entities": X_dict["candidates"],
+                                "labels": Y_dict["NED_label"]}, f)
+                        exit()
 
-                    # Perform backward pass to calculate gradients
-                    if Meta.config["learner_config"]["fp16"]:
-                        with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                            scaled_loss.backward()
                     else:
-                        loss.backward()  # type: ignore
+                        loss, _, _, _ = self._compute_loss(model, uids, X_dict, Y_dict, task_to_label_dict, data_name, split)
+                        # If loss dict is empty, skip
+                        if loss is None:
+                            continue
+
+                        # Perform backward pass to calculate gradients
+                        if Meta.config["learner_config"]["fp16"]:
+                            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                                scaled_loss.backward()
+                        else:
+                            loss.backward()  # type: ignore
 
                 if (total_batch_num + 1) % Meta.config["learner_config"][
                     "optimizer_config"
@@ -667,6 +743,15 @@ class EmmentalLearner(object):
 
                     # Update the parameters
                     self.optimizer.step()
+                    if Meta.save_grads:
+                        with torch.no_grad():
+                            #for name, param in model.named_parameters():
+                            self.gradients.append(torch.cat([g.grad.view(-1).cpu() for g in list(model.parameters()) if g.grad is not None], dim=0))
+                            if (total_batch_num + 1) % Meta.variance_steps == 0 or (batch_num + 1 == self.n_batches_per_epoch and epoch_num + 1 == Meta.config["learner_config"]["n_epochs"]):
+                                variance = torch.stack(self.gradients).var(0)
+                                self.variances.append((variance.max(), variance.mean()))
+                                self.gradients = []
+                                logger.info(self.variances[-1])
 
                     # Set gradients of all model parameters to zero
                     self.optimizer.zero_grad()
