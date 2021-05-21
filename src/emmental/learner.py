@@ -662,6 +662,8 @@ class EmmentalLearner(object):
                         model.zero_grad()
                         loss, prob_dict, loss_dict, out_dict = self._compute_loss(model, uids, X_dict, Y_dict, task_to_label_dict, data_name, split)
                         me_scores = loss_dict["NED"]["scores"]
+                        num_entities = loss_dict["NED"]["num_entities"]
+                        num_mentions = loss_dict["NED"]["num_mentions"]
                         if isinstance(me_scores, tuple):
                             dout_dpairs = torch.cat([torch.autograd.grad(loss, s, retain_graph=True, allow_unused=True)[0].detach().cpu() for s in me_scores])
                             dpairs_dmodel = []
@@ -687,12 +689,17 @@ class EmmentalLearner(object):
                         indiv_grads = (dout_dpairs.unsqueeze(-1).unsqueeze(-1) * dpairs_dmodel)
                         summed_grads = indiv_grads.sum(0)
 
+
                         # sanity check that gradients add up expected
                         model.zero_grad()
                         loss.backward()
                         for n, p in model.named_parameters():
                             if n == Meta.layer_grad:
                                 assert torch.allclose(p.grad.cpu(), summed_grads, rtol=1e-04, atol=1e-05)
+
+                        # sum gradients for each entity over mentions
+                        indiv_grads = indiv_grads.reshape(num_mentions, num_entities, -1)
+                        # indiv_grads = indiv_grads.sum(1)
 
                         # save and exit (for now just do one batch)
                         file = f'{Meta.log_path}/indiv_grads_{Meta.layer_grad}.pkl'
